@@ -384,7 +384,311 @@ class Seq2Seq(nn.Module):
                 break
         preds = torch.stack(preds, dim=-1)
         return preds
-    
+
+class PositionalEncoding(nn.Module):
+    """
+    位置编码: PE(pos, 2i) = sin(pos / 10000^(2i/d_model))
+             PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
+    """
+    def __init__(self, d_model, max_len=512, dropout=0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # [1, max_len, d_model]
+
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        """
+        x: [N, L, d_model]
+        """
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+
+class ScaledDotProductAttention(nn.Module):
+    """
+    Scaled Dot-Product Attention
+    Attention(Q, K, V) = softmax(Q·K^T / √d_k) · V
+    """
+    def __init__(self, d_k, dropout=0.1):
+        super().__init__()
+        self.scale = d_k ** 0.5
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, Q, K, V, mask=None):
+        """
+        Q: [N, num_heads, L_q, d_k]
+        K: [N, num_heads, L_k, d_k]
+        V: [N, num_heads, L_k, d_v]
+        mask: [N, 1, 1, L_k] 或 [N, 1, L_q, L_k]
+        """
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale  # [N, heads, L_q, L_k]
+
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+
+        attn_weights = F.softmax(scores, dim=-1)
+        # 处理全 mask 情况：当某行全为 -inf 时，softmax 会产生 NaN，将其替换为 0
+        attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
+        attn_weights = self.dropout(attn_weights)
+
+        output = torch.matmul(attn_weights, V)  # [N, heads, L_q, d_v]
+        return output, attn_weights
+
+
+class MultiHeadAttention(nn.Module):
+    """
+    Multi-Head Attention
+    """
+    def __init__(self, d_model, num_heads, dropout=0.1):
+        super().__init__()
+        assert d_model % num_heads == 0
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+
+        self.attention = ScaledDotProductAttention(self.d_k, dropout)
+
+    def forward(self, q, k, v, mask=None):
+        """
+        q, k, v: [N, L, d_model]
+        mask: [N, 1, 1, L_k] 或 [N, 1, L_q, L_k]
+        """
+        N = q.size(0)
+
+        # 线性投影 + reshape 成多头: [N, L, d_model] -> [N, num_heads, L, d_k]
+        Q = self.W_q(q).view(N, -1, self.num_heads, self.d_k).transpose(1, 2)
+        K = self.W_k(k).view(N, -1, self.num_heads, self.d_k).transpose(1, 2)
+        V = self.W_v(v).view(N, -1, self.num_heads, self.d_k).transpose(1, 2)
+
+        # Scaled Dot-Product Attention
+        out, attn = self.attention(Q, K, V, mask)
+
+        # 拼接多头: [N, num_heads, L, d_k] -> [N, L, d_model]
+        out = out.transpose(1, 2).contiguous().view(N, -1, self.d_model)
+        out = self.W_o(out)
+
+        return out, attn
+
+
+class PositionwiseFeedForward(nn.Module):
+    """
+    Position-wise Feed-Forward Network
+    FFN(x) = max(0, xW_1 + b_1)W_2 + b_2
+    """
+    def __init__(self, d_model, d_ff, dropout=0.1):
+        super().__init__()
+        self.fc1 = nn.Linear(d_model, d_ff)
+        self.fc2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, x):
+        return self.fc2(self.dropout(F.relu(self.fc1(x))))
+
+
+class TransformerEncoderLayer(nn.Module):
+    """
+    Transformer Encoder Layer: Self-Attention + FFN
+    """
+    def __init__(self, d_model, num_heads, d_ff, dropout=0.1):
+        super().__init__()
+        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        self.ffn = PositionwiseFeedForward(d_model, d_ff, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(p=dropout)
+        self.dropout2 = nn.Dropout(p=dropout)
+
+    def forward(self, x, src_mask=None):
+        # Self-Attention + Add & Norm
+        attn_out, _ = self.self_attn(x, x, x, src_mask)
+        x = self.norm1(x + self.dropout1(attn_out))
+
+        # FFN + Add & Norm
+        ffn_out = self.ffn(x)
+        x = self.norm2(x + self.dropout2(ffn_out))
+
+        return x
+
+
+class TransformerDecoderLayer(nn.Module):
+    """
+    Transformer Decoder Layer: Masked Self-Attention + Cross-Attention + FFN
+    """
+    def __init__(self, d_model, num_heads, d_ff, dropout=0.1):
+        super().__init__()
+        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        self.cross_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        self.ffn = PositionwiseFeedForward(d_model, d_ff, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(p=dropout)
+        self.dropout2 = nn.Dropout(p=dropout)
+        self.dropout3 = nn.Dropout(p=dropout)
+
+    def forward(self, x, enc_output, tgt_mask=None, src_mask=None):
+        # Masked Self-Attention + Add & Norm
+        attn_out, _ = self.self_attn(x, x, x, tgt_mask)
+        x = self.norm1(x + self.dropout1(attn_out))
+
+        # Cross-Attention + Add & Norm
+        attn_out, _ = self.cross_attn(x, enc_output, enc_output, src_mask)
+        x = self.norm2(x + self.dropout2(attn_out))
+
+        # FFN + Add & Norm
+        ffn_out = self.ffn(x)
+        x = self.norm3(x + self.dropout3(ffn_out))
+
+        return x
+
+
+class Transformer(nn.Module):
+    """
+    完整的 Transformer 模型
+    """
+    def __init__(self, src_vocab, tgt_vocab, d_model=256, num_heads=8, num_layers=3,
+                 d_ff=512, dropout=0.1, max_len=512):
+        super().__init__()
+        self.src_vocab = src_vocab
+        self.tgt_vocab = tgt_vocab
+        self.d_model = d_model
+        self.max_len = max_len
+
+        # Embedding layers
+        self.src_embedding = nn.Embedding(len(src_vocab), d_model)
+        self.tgt_embedding = nn.Embedding(len(tgt_vocab), d_model)
+        self.pos_encoding = PositionalEncoding(d_model, max_len, dropout)
+
+        # Encoder
+        self.encoder_layers = nn.ModuleList([
+            TransformerEncoderLayer(d_model, num_heads, d_ff, dropout)
+            for _ in range(num_layers)
+        ])
+
+        # Decoder
+        self.decoder_layers = nn.ModuleList([
+            TransformerDecoderLayer(d_model, num_heads, d_ff, dropout)
+            for _ in range(num_layers)
+        ])
+
+        # Output projection
+        self.fc_out = nn.Linear(d_model, len(tgt_vocab))
+        self.softmax = nn.LogSoftmax(dim=-1)
+
+        # 初始化参数
+        self._init_parameters()
+
+    def _init_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def make_src_mask(self, src):
+        """
+        src: [N, L]
+        返回: [N, 1, 1, L] - PAD 位置为 0，其他为 1
+        """
+        src_mask = (src != self.src_vocab.index("[PAD]")).unsqueeze(1).unsqueeze(2)
+        return src_mask
+
+    def make_tgt_mask(self, tgt):
+        """
+        tgt: [N, L]
+        返回: [N, 1, L, L] - 结合 PAD mask 和 causal mask
+        """
+        N, L = tgt.size()
+        # PAD mask: [N, 1, 1, L]
+        pad_mask = (tgt != self.tgt_vocab.index("[PAD]")).unsqueeze(1).unsqueeze(2)
+        # Causal mask (下三角): [1, 1, L, L]
+        causal_mask = torch.tril(torch.ones((1, 1, L, L), device=tgt.device)).bool()
+        # 组合两个 mask
+        tgt_mask = pad_mask & causal_mask
+        return tgt_mask
+
+    def encode(self, src, src_mask):
+        """
+        Encoder forward
+        src: [N, L]
+        """
+        x = self.src_embedding(src) * (self.d_model ** 0.5)
+        x = self.pos_encoding(x)
+
+        for layer in self.encoder_layers:
+            x = layer(x, src_mask)
+
+        return x
+
+    def decode(self, tgt, enc_output, tgt_mask, src_mask):
+        """
+        Decoder forward
+        tgt: [N, L]
+        """
+        x = self.tgt_embedding(tgt) * (self.d_model ** 0.5)
+        x = self.pos_encoding(x)
+
+        for layer in self.decoder_layers:
+            x = layer(x, enc_output, tgt_mask, src_mask)
+
+        return x
+
+    def forward(self, src, tgt):
+        """
+        训练时的前向传播
+        src: [N, Ls]
+        tgt: [N, Lt]
+        """
+        src_mask = self.make_src_mask(src)
+        tgt_mask = self.make_tgt_mask(tgt[:, :-1])  # 去掉最后一个 token
+
+        enc_output = self.encode(src, src_mask)
+        dec_output = self.decode(tgt[:, :-1], enc_output, tgt_mask, src_mask)
+
+        output = self.fc_out(dec_output)
+        output = self.softmax(output)
+
+        return output
+
+    def predict(self, src):
+        """
+        预测时的自回归解码
+        src: [1, Ls]
+        """
+        self.eval()
+        device = src.device
+        src_mask = self.make_src_mask(src)
+        enc_output = self.encode(src, src_mask)
+
+        # 初始化解码输入为 [BOS]
+        tgt = torch.LongTensor([[self.tgt_vocab.index("[BOS]")]]).to(device)
+
+        # 使用 while 循环，确保 tgt 长度不超过 max_len（避免位置编码越界）
+        while tgt.size(1) < self.max_len:
+            tgt_mask = self.make_tgt_mask(tgt)
+            dec_output = self.decode(tgt, enc_output, tgt_mask, src_mask)
+            output = self.fc_out(dec_output[:, -1, :])  # 只取最后一个位置
+            next_token = output.argmax(dim=-1, keepdim=True)
+
+            tgt = torch.cat([tgt, next_token], dim=1)
+
+            if next_token.item() == self.tgt_vocab.index("[EOS]"):
+                break
+
+        return tgt
+
 
 # 构建Dataloader
 def collate(data_list):
@@ -408,14 +712,20 @@ def create_dataloader(zh_sents, en_sents, max_len, batch_size, pad_id):
     return dataloaders['train'], dataloaders['val'], dataloaders['test']
 
 # 训练、测试函数
-def train_loop(model, optimizer, criterion, loader, device):
+def train_loop(model, optimizer, criterion, loader, device, is_transformer=False):
     model.train()
     epoch_loss = 0.0
     for src, tgt in tqdm(loader):
         src = src.to(device)
         tgt = tgt.to(device)
         outputs = model(src, tgt)
-        loss = criterion(outputs[:,:-1,:].reshape(-1, outputs.shape[-1]), tgt[:,1:].reshape(-1))
+
+        if is_transformer:
+            # Transformer forward 输入 tgt[:, :-1]，输出 [N, Lt-1, V]
+            loss = criterion(outputs.reshape(-1, outputs.shape[-1]), tgt[:, 1:].reshape(-1))
+        else:
+            # Seq2Seq forward 输出 [N, Lt, V]，需要去掉最后一个位置
+            loss = criterion(outputs[:, :-1, :].reshape(-1, outputs.shape[-1]), tgt[:, 1:].reshape(-1))
 
         optimizer.zero_grad()
         loss.backward()
@@ -455,8 +765,17 @@ if __name__ == '__main__':
     parser.add_argument('--optim', type=str, default='adam')
     parser.add_argument('--num_epoch', type=int, default=10)
     parser.add_argument('--lr', type=float, default=0.0005)
+    # Seq2Seq 参数
     parser.add_argument('--cell_type', type=str, default='rnn', choices=['rnn', 'lstm'], help="RNN单元类型: rnn 或 lstm")
     parser.add_argument('--attention', action='store_true', help="是否使用注意力机制")
+    # 模型选择
+    parser.add_argument('--model', type=str, default='seq2seq', choices=['seq2seq', 'transformer'], help="模型类型")
+    # Transformer 参数
+    parser.add_argument('--num_layers', type=int, default=3, help="Transformer层数")
+    parser.add_argument('--num_heads', type=int, default=8, help="注意力头数")
+    parser.add_argument('--hidden_size', type=int, default=256, help="隐藏层大小")
+    parser.add_argument('--ffn_hidden_size', type=int, default=512, help="FFN隐藏层大小")
+    parser.add_argument('--dropout', type=float, default=0.1, help="Dropout率")
     args = parser.parse_args()
 
     zh_sents, en_sents = load_data(args.num_train)
@@ -474,10 +793,32 @@ if __name__ == '__main__':
     torch.manual_seed(1)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # 根据参数选择模型配置
-    print(f"使用模型配置: cell_type={args.cell_type}, attention={args.attention}")
-    model = Seq2Seq(zh_vocab, en_vocab, embedding_dim=256, hidden_size=256, max_len=args.max_len,
-                    cell_type=args.cell_type, use_attention=args.attention)
+    # 根据参数选择模型
+    is_transformer = (args.model == 'transformer')
+
+    if is_transformer:
+        print(f"使用 Transformer 模型: num_layers={args.num_layers}, num_heads={args.num_heads}, "
+              f"hidden_size={args.hidden_size}, ffn_hidden_size={args.ffn_hidden_size}, dropout={args.dropout}")
+        model = Transformer(
+            src_vocab=zh_vocab,
+            tgt_vocab=en_vocab,
+            d_model=args.hidden_size,
+            num_heads=args.num_heads,
+            num_layers=args.num_layers,
+            d_ff=args.ffn_hidden_size,
+            dropout=args.dropout,
+            max_len=args.max_len + 2
+        )
+        model_name = "model_transformer.pt"
+    else:
+        print(f"使用 Seq2Seq 模型: cell_type={args.cell_type}, attention={args.attention}")
+        model = Seq2Seq(zh_vocab, en_vocab, embedding_dim=256, hidden_size=256, max_len=args.max_len,
+                        cell_type=args.cell_type, use_attention=args.attention)
+        model_name = f"model_{args.cell_type}"
+        if args.attention:
+            model_name += "_attn"
+        model_name += ".pt"
+
     model.to(device)
     if args.optim=='sgd':
         optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
@@ -487,17 +828,11 @@ if __name__ == '__main__':
     weights[en_vocab.word2idx['[PAD]']] = 0 # set the loss of [PAD] to zero
     criterion = nn.NLLLoss(weight=weights)
 
-    # 根据模型配置生成 checkpoint 文件名
-    model_name = f"model_{args.cell_type}"
-    if args.attention:
-        model_name += "_attn"
-    model_name += ".pt"
-
     # 训练
     start_time = time.time()
     best_score = 0.0
     for _ in range(args.num_epoch):
-        loss = train_loop(model, optimizer, criterion, trainloader, device)
+        loss = train_loop(model, optimizer, criterion, trainloader, device, is_transformer)
         hypotheses, references, bleu_score = test_loop(model, validloader, en_vocab, device)
         # 保存验证集上bleu最高的checkpoint
         if bleu_score > best_score:
