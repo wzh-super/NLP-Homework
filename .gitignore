@@ -3,3 +3,5 @@ AGENTS.md
 CLAUDE.md
 data/
 .vscode/
+*.pt
+__pycache__/
