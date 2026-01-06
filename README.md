@@ -2,9 +2,7 @@
 
 > 课程：自然语言处理  
 > 作业：作业 2（基于 Seq2Seq 的机器翻译）  
-> 姓名：王政浩
-> 学号：2200013134 
-> 日期：2026.1.6
+
 
 ## 1. 任务描述
 本任务为中英文机器翻译（Machine Translation, MT）：给定中文 token 序列作为输入，生成对应英文 token 序列。数据以“空格分词 + 制表符分隔”的平行语料形式提供：每行一条样本，格式为 `中文tokens\tEnglish tokens`（见 `data/zh_en_{train,val,test}.txt`）。
